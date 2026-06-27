@@ -1,6 +1,7 @@
 {
   "name": "farias-proxy-rotator",
   "version": "1.0.0",
+  "license": "ISC",
   "private": true,
   "scripts": {
     "start": "go run .",
