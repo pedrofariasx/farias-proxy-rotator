@@ -188,8 +188,6 @@ curl http://localhost:3000/refresh
 
 Proxies públicos costumam ser instáveis. Mesmo com validação e manutenção automática, a disponibilidade depende da qualidade da lista retornada pelo ProxyDB.
 
-O arquivo `.env` é ignorado pelo Git para evitar expor tokens ou headers sensíveis.
-
 ## Uso Responsável
 
 Use este projeto somente em ambientes, serviços e APIs onde você tem autorização para testar. Respeite limites de taxa, termos de uso, robots.txt quando aplicável e legislações locais.
