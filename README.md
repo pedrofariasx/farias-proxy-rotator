@@ -86,6 +86,10 @@ TARGET_HEADERS=
 | `TARGET_AUTHORIZATION` | Valor do header `Authorization` enviado ao target. |
 | `TARGET_HEADERS` | Headers extras no formato `header: valor|outro: valor`. |
 
+Para APIs de IA com prompts grandes, mantenha `TARGET_RESPONSE_TIMEOUT_MS=0` e `PROXY_HEADER_TIMEOUT_MS=0`. Isso evita encerrar a requisição enquanto o provedor ainda está processando antes de enviar os primeiros headers.
+
+Se muitas pessoas forem usar o proxy ao mesmo tempo, configure `MAX_CONCURRENT_REQUESTS` com um valor compatível com CPU, memória e quantidade de proxies saudáveis disponíveis. Use `0` apenas quando quiser deixar ilimitado.
+
 ## Autenticação No Target
 
 Para enviar `Authorization`:

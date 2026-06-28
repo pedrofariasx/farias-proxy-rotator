@@ -71,6 +71,7 @@ type ProxyPool struct {
 	dead           map[string]time.Time
 	healthy        []*HealthyProxy
 	candidateIndex int
+	lastRecycle    time.Time
 	healthyIndex   int
 	lastRefresh    time.Time
 	refreshing     bool
@@ -100,12 +101,6 @@ func main() {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *ProxyPool) {
-	if !pool.AcquireRequest(r.Context()) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "limite de requisicoes simultaneas atingido"})
-		return
-	}
-	defer pool.ReleaseRequest()
-
 	if r.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stats": pool.Stats()})
 		return
@@ -124,6 +119,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *Pro
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stats": pool.Stats()})
 		return
 	}
+
+	if !pool.AcquireRequest(r.Context()) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "limite de requisicoes simultaneas atingido"})
+		return
+	}
+	defer pool.ReleaseRequest()
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -536,9 +537,20 @@ func (p *ProxyPool) nextCandidate() (Proxy, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for p.candidateIndex < len(p.candidates) {
+	checked := 0
+
+	for checked < len(p.candidates) {
+		if p.candidateIndex >= len(p.candidates) {
+			if !p.hasExpiredDeadLocked() {
+				break
+			}
+			p.candidateIndex = 0
+			p.lastRecycle = time.Now()
+		}
+
 		proxy := p.candidates[p.candidateIndex]
 		p.candidateIndex++
+		checked++
 
 		if deadAt, dead := p.dead[proxyKey(proxy)]; dead && time.Since(deadAt) < p.cfg.DeadProxyRetryAfter {
 			continue
@@ -551,6 +563,21 @@ func (p *ProxyPool) nextCandidate() (Proxy, bool) {
 	}
 
 	return Proxy{}, false
+}
+
+func (p *ProxyPool) hasExpiredDeadLocked() bool {
+	if len(p.dead) == 0 || time.Since(p.lastRecycle) < p.cfg.DeadProxyRetryAfter {
+		return false
+	}
+
+	now := time.Now()
+	for _, deadAt := range p.dead {
+		if now.Sub(deadAt) >= p.cfg.DeadProxyRetryAfter {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *ProxyPool) addHealthy(proxy Proxy, latency time.Duration) {
