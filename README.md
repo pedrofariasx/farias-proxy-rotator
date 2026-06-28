@@ -33,7 +33,7 @@ Exemplo de configuração:
 ```env
 PORT=3000
 TARGET_URL=https://httpbin.org/ip
-PROXY_SOURCE_URL=https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100
+PROXY_SOURCE_URL=https://freeproxydb.com/api/proxy/search?country=&protocol=http,socks4,socks5&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100
 PROXY_SOURCE_PAGES=20
 PROXY_SOURCE_PAGE_SIZE=100
 PROXY_SOURCE_MAX_PAGES=100
@@ -63,7 +63,7 @@ TARGET_HEADERS=
 |---|---|
 | `PORT` | Porta local do servidor. |
 | `TARGET_URL` | URL final que será chamada através dos proxies. |
-| `PROXY_SOURCE_URL` | URL base do FreeProxyDB usada para coletar proxies. |
+| `PROXY_SOURCE_URL` | URL base do FreeProxyDB usada para coletar proxies. O padrão busca `http`, `socks4` e `socks5`. |
 | `PROXY_SOURCE_PAGES` | Quantidade de páginas do FreeProxyDB para buscar. |
 | `PROXY_SOURCE_PAGE_SIZE` | Tamanho da página no FreeProxyDB. Normalmente `100`. |
 | `PROXY_SOURCE_MAX_PAGES` | Limite máximo de páginas extras para continuar buscando quando a fonte retorna poucos candidatos. |

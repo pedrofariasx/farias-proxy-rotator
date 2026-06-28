@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -833,20 +834,29 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL s
 		return nil, err
 	}
 
+	dialer := &net.Dialer{
+		Timeout:   connectTimeout,
+		KeepAlive: 15 * time.Second,
+	}
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(&url.URL{
-			Scheme: "http",
-			Host:   net.JoinHostPort(proxy.Host, strconv.Itoa(proxy.Port)),
-		}),
-		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout,
-			KeepAlive: 15 * time.Second,
-		}).DialContext,
+		DialContext:           dialer.DialContext,
 		TLSClientConfig:       &tls.Config{ServerName: target.Hostname(), MinVersion: tls.VersionTLS12},
 		TLSHandshakeTimeout:   connectTimeout,
 		ResponseHeaderTimeout: headerTimeout,
 		ExpectContinueTimeout: time.Second,
 		DisableKeepAlives:     true,
+	}
+
+	switch strings.ToLower(proxy.Protocol) {
+	case "socks4", "socks5":
+		transport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+			return dialSOCKSProxy(ctx, dialer, proxy, address, connectTimeout)
+		}
+	default:
+		transport.Proxy = http.ProxyURL(&url.URL{
+			Scheme: "http",
+			Host:   net.JoinHostPort(proxy.Host, strconv.Itoa(proxy.Port)),
+		})
 	}
 	defer transport.CloseIdleConnections()
 
@@ -873,13 +883,153 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL s
 	return resp, nil
 }
 
+func dialSOCKSProxy(ctx context.Context, dialer *net.Dialer, proxy Proxy, targetAddress string, timeout time.Duration) (net.Conn, error) {
+	proxyAddress := net.JoinHostPort(proxy.Host, strconv.Itoa(proxy.Port))
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else if timeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+	}
+
+	if strings.EqualFold(proxy.Protocol, "socks5") {
+		err = socks5Connect(conn, targetAddress)
+	} else {
+		err = socks4Connect(conn, targetAddress)
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func socks5Connect(conn net.Conn, targetAddress string) error {
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return err
+	}
+
+	methodResponse := []byte{0, 0}
+	if _, err := io.ReadFull(conn, methodResponse); err != nil {
+		return err
+	}
+	if methodResponse[0] != 0x05 || methodResponse[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 sem metodo no-auth: %v", methodResponse)
+	}
+
+	host, port, err := splitHostPort(targetAddress)
+	if err != nil {
+		return err
+	}
+
+	request := []byte{0x05, 0x01, 0x00}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		request = append(request, 0x01)
+		request = append(request, ip.To4()...)
+	} else if ip := net.ParseIP(host); ip != nil {
+		request = append(request, 0x04)
+		request = append(request, ip.To16()...)
+	} else {
+		if len(host) > 255 {
+			return fmt.Errorf("host muito longo para SOCKS5: %s", host)
+		}
+		request = append(request, 0x03, byte(len(host)))
+		request = append(request, []byte(host)...)
+	}
+	request = binary.BigEndian.AppendUint16(request, uint16(port))
+
+	if _, err := conn.Write(request); err != nil {
+		return err
+	}
+
+	response := make([]byte, 4)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	if response[0] != 0x05 || response[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 CONNECT falhou: codigo=%d", response[1])
+	}
+
+	switch response[3] {
+	case 0x01:
+		_, err = io.ReadFull(conn, make([]byte, 4+2))
+	case 0x03:
+		length := []byte{0}
+		if _, err = io.ReadFull(conn, length); err != nil {
+			return err
+		}
+		_, err = io.ReadFull(conn, make([]byte, int(length[0])+2))
+	case 0x04:
+		_, err = io.ReadFull(conn, make([]byte, 16+2))
+	default:
+		err = fmt.Errorf("SOCKS5 atyp invalido: %d", response[3])
+	}
+
+	return err
+}
+
+func socks4Connect(conn net.Conn, targetAddress string) error {
+	host, port, err := splitHostPort(targetAddress)
+	if err != nil {
+		return err
+	}
+
+	ip := net.ParseIP(host).To4()
+	useDomain := ip == nil
+	if useDomain {
+		ip = net.IPv4(0, 0, 0, 1)
+	}
+
+	request := []byte{0x04, 0x01}
+	request = binary.BigEndian.AppendUint16(request, uint16(port))
+	request = append(request, ip...)
+	request = append(request, 0x00)
+	if useDomain {
+		request = append(request, []byte(host)...)
+		request = append(request, 0x00)
+	}
+
+	if _, err := conn.Write(request); err != nil {
+		return err
+	}
+
+	response := make([]byte, 8)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	if response[1] != 0x5a {
+		return fmt.Errorf("SOCKS4 CONNECT falhou: codigo=%d", response[1])
+	}
+
+	return nil
+}
+
+func splitHostPort(address string) (string, int, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("porta invalida: %s", portText)
+	}
+
+	return host, port, nil
+}
+
 func loadConfig() Config {
 	loadEnvFile(".env")
 
 	return Config{
 		Port:                       intEnv("PORT", 3000),
 		TargetURL:                  stringEnv("TARGET_URL", "https://httpbin.org/ip"),
-		ProxySourceURL:             stringEnv("PROXY_SOURCE_URL", "https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100"),
+		ProxySourceURL:             stringEnv("PROXY_SOURCE_URL", "https://freeproxydb.com/api/proxy/search?country=&protocol=http,socks4,socks5&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100"),
 		ProxySourcePages:           intEnv("PROXY_SOURCE_PAGES", 20),
 		ProxySourcePageSize:        intEnv("PROXY_SOURCE_PAGE_SIZE", 100),
 		ProxySourceMaxPages:        intEnv("PROXY_SOURCE_MAX_PAGES", 100),
