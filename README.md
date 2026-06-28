@@ -36,6 +36,7 @@ TARGET_URL=https://httpbin.org/ip
 PROXY_SOURCE_URL=https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100
 PROXY_SOURCE_PAGES=20
 PROXY_SOURCE_PAGE_SIZE=100
+PROXY_SOURCE_MAX_PAGES=100
 PROXY_REQUIRE_HTTPS=false
 PROXY_REFRESH_SECONDS=300
 PROXY_TIMEOUT_MS=5000
@@ -58,6 +59,7 @@ TARGET_HEADERS=
 | `PROXY_SOURCE_URL` | URL base do FreeProxyDB usada para coletar proxies. |
 | `PROXY_SOURCE_PAGES` | Quantidade de páginas do FreeProxyDB para buscar. |
 | `PROXY_SOURCE_PAGE_SIZE` | Tamanho da página no FreeProxyDB. Normalmente `100`. |
+| `PROXY_SOURCE_MAX_PAGES` | Limite máximo de páginas extras para continuar buscando quando a fonte retorna poucos candidatos. |
 | `PROXY_REQUIRE_HTTPS` | Se `true`, usa apenas proxies marcados como HTTPS pela fonte. Por padrão fica `false` porque proxies HTTP também podem fazer `CONNECT` para targets HTTPS. |
 | `PROXY_REFRESH_SECONDS` | Intervalo de atualização da lista de proxies. |
 | `PROXY_TIMEOUT_MS` | Tempo máximo total esperado para uma requisição. |
@@ -133,6 +135,22 @@ Qualquer requisição enviada ao servidor local será encaminhada para `TARGET_U
 ```bash
 curl http://localhost:3000
 ```
+
+Rotas e query strings chamadas no proxy local são anexadas ao `TARGET_URL`.
+
+Exemplo com `TARGET_URL=https://api.exemplo.com`:
+
+```bash
+curl 'http://localhost:3000/v1/users?limit=10'
+```
+
+Destino final:
+
+```text
+https://api.exemplo.com/v1/users?limit=10
+```
+
+Se o `TARGET_URL` já tiver path, o path local é acrescentado no final. Exemplo: `TARGET_URL=https://api.exemplo.com/base` com `/v1` vira `https://api.exemplo.com/base/v1`.
 
 Exemplo com `POST`:
 

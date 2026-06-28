@@ -27,6 +27,7 @@ type Config struct {
 	ProxySourceURL             string
 	ProxySourcePages           int
 	ProxySourcePageSize        int
+	ProxySourceMaxPages        int
 	ProxyRequireHTTPS          bool
 	ProxyRefresh               time.Duration
 	ProxyTimeout               time.Duration
@@ -116,7 +117,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *Pro
 		return
 	}
 
-	resp, proxy, err := requestWithRotation(r.Context(), cfg, pool, r.Method, body)
+	targetURL, err := buildTargetURL(cfg.TargetURL, r.URL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	resp, proxy, err := requestWithRotation(r.Context(), cfg, pool, targetURL, r.Method, body)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "stats": pool.Stats()})
 		return
@@ -129,7 +136,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *Pro
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, method string, body []byte) (*http.Response, Proxy, error) {
+func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, targetURL string, method string, body []byte) (*http.Response, Proxy, error) {
 	ctx, cancel := context.WithTimeout(parent, cfg.ProxyTimeout)
 	defer cancel()
 
@@ -150,7 +157,7 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, me
 		tried[proxyKey(proxy)] = struct{}{}
 
 		started := time.Now()
-		resp, err := DoThroughProxy(ctx, cfg, proxy, method, body)
+		resp, err := DoThroughProxy(ctx, cfg, proxy, targetURL, method, body)
 		if err == nil {
 			pool.MarkSuccess(proxy, time.Since(started))
 			return resp, proxy, nil
@@ -239,8 +246,9 @@ func (p *ProxyPool) Refresh(ctx context.Context, force bool) error {
 		return errors.New("nenhum proxy encontrado na fonte configurada")
 	}
 
-	p.mergeCandidates(proxies)
+	added := p.mergeCandidates(proxies)
 	p.lastRefresh = time.Now()
+	log.Printf("Fonte de proxies atualizada: %d coletados, %d novos candidatos, total=%d, candidatos_restantes=%d", len(proxies), added, len(p.proxies), max(0, len(p.candidates)-p.candidateIndex))
 	return nil
 }
 
@@ -427,7 +435,7 @@ func (p *ProxyPool) DeadCount() int {
 
 func (p *ProxyPool) validateCandidate(ctx context.Context, proxy Proxy) {
 	started := time.Now()
-	resp, err := DoThroughProxy(ctx, p.cfg, proxy, http.MethodGet, nil)
+	resp, err := DoThroughProxy(ctx, p.cfg, proxy, p.cfg.TargetURL, http.MethodGet, nil)
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -441,7 +449,7 @@ func (p *ProxyPool) validateCandidate(ctx context.Context, proxy Proxy) {
 	p.addHealthy(proxy, time.Since(started))
 }
 
-func (p *ProxyPool) mergeCandidates(proxies []Proxy) {
+func (p *ProxyPool) mergeCandidates(proxies []Proxy) int {
 	known := make(map[string]struct{}, len(p.proxies)+len(p.healthy)+len(p.dead))
 	for _, proxy := range p.proxies {
 		known[proxyKey(proxy)] = struct{}{}
@@ -449,19 +457,23 @@ func (p *ProxyPool) mergeCandidates(proxies []Proxy) {
 	for _, proxy := range p.healthy {
 		known[proxyKey(proxy.Proxy)] = struct{}{}
 	}
-	for key := range p.dead {
-		known[key] = struct{}{}
-	}
+	// Proxies descartados podem voltar a ficar validos em outra coleta; permitir
+	// reentrada evita esgotar a fonte quando a API retorna poucos itens por pagina.
 
+	added := 0
 	for _, proxy := range proxies {
 		key := proxyKey(proxy)
 		if _, ok := known[key]; ok {
 			continue
 		}
 		known[key] = struct{}{}
+		delete(p.dead, key)
 		p.proxies = append(p.proxies, proxy)
 		p.candidates = append(p.candidates, proxy)
+		added++
 	}
+
+	return added
 }
 
 func (p *ProxyPool) nextCandidate() (Proxy, bool) {
@@ -549,10 +561,14 @@ func FetchProxyList(ctx context.Context, cfg Config) ([]Proxy, error) {
 		err     error
 	}
 
-	results := make(chan result, cfg.ProxySourcePages)
+	pages := cfg.ProxySourcePages
+	if pages <= 0 {
+		pages = 1
+	}
+	results := make(chan result, pages)
 	var wg sync.WaitGroup
 
-	for page := 1; page <= cfg.ProxySourcePages; page++ {
+	for page := 1; page <= pages; page++ {
 		pageURL := withPage(cfg.ProxySourceURL, page, cfg.ProxySourcePageSize)
 		wg.Add(1)
 		go func() {
@@ -587,11 +603,47 @@ func FetchProxyList(ctx context.Context, cfg Config) ([]Proxy, error) {
 		}
 	}
 
+	if len(proxies) < cfg.HealthyProxyTarget && cfg.ProxySourceMaxPages > pages {
+		more, err := fetchProxyListSequential(ctx, client, cfg, pages+1, cfg.ProxySourceMaxPages, seen)
+		if err != nil {
+			lastErr = err
+		}
+		proxies = append(proxies, more...)
+	}
+
 	if len(proxies) == 0 && lastErr != nil {
 		return nil, lastErr
 	}
 
 	return proxies, nil
+}
+
+func fetchProxyListSequential(ctx context.Context, client *http.Client, cfg Config, startPage int, maxPage int, seen map[string]struct{}) ([]Proxy, error) {
+	var proxies []Proxy
+	var lastErr error
+
+	for page := startPage; page <= maxPage && len(proxies) < cfg.HealthyProxyTarget; page++ {
+		pageURL := withPage(cfg.ProxySourceURL, page, cfg.ProxySourcePageSize)
+		pageProxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(pageProxies) == 0 {
+			break
+		}
+
+		for _, proxy := range pageProxies {
+			key := proxyKey(proxy)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			proxies = append(proxies, proxy)
+		}
+	}
+
+	return proxies, lastErr
 }
 
 type freeProxyDBResponse struct {
@@ -664,7 +716,7 @@ func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, re
 	return proxies, nil
 }
 
-func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, method string, body []byte) (*http.Response, error) {
+func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL string, method string, body []byte) (*http.Response, error) {
 	attemptTimeout := cfg.ProxyAttemptTimeout
 	if attemptTimeout <= 0 {
 		attemptTimeout = cfg.ProxyTimeout
@@ -673,7 +725,7 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, method stri
 	ctx, cancel := context.WithTimeout(parent, attemptTimeout)
 	defer cancel()
 
-	target, err := url.Parse(cfg.TargetURL)
+	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
 	}
@@ -696,7 +748,7 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, method stri
 	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport, Timeout: attemptTimeout}
-	req, err := http.NewRequestWithContext(ctx, method, cfg.TargetURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -727,6 +779,7 @@ func loadConfig() Config {
 		ProxySourceURL:             stringEnv("PROXY_SOURCE_URL", "https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100"),
 		ProxySourcePages:           intEnv("PROXY_SOURCE_PAGES", 20),
 		ProxySourcePageSize:        intEnv("PROXY_SOURCE_PAGE_SIZE", 100),
+		ProxySourceMaxPages:        intEnv("PROXY_SOURCE_MAX_PAGES", 100),
 		ProxyRequireHTTPS:          boolEnv("PROXY_REQUIRE_HTTPS", false),
 		ProxyRefresh:               time.Duration(intEnv("PROXY_REFRESH_SECONDS", 300)) * time.Second,
 		ProxyTimeout:               time.Duration(intEnv("PROXY_TIMEOUT_MS", 5000)) * time.Millisecond,
@@ -818,6 +871,35 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func buildTargetURL(base string, incoming *url.URL) (string, error) {
+	target, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	if incoming.Path != "" && incoming.Path != "/" {
+		target.Path = joinURLPath(target.Path, incoming.Path)
+	}
+
+	if incoming.RawQuery != "" {
+		if target.RawQuery == "" {
+			target.RawQuery = incoming.RawQuery
+		} else {
+			target.RawQuery = target.RawQuery + "&" + incoming.RawQuery
+		}
+	}
+
+	return target.String(), nil
+}
+
+func joinURLPath(basePath string, extraPath string) string {
+	if basePath == "" || basePath == "/" {
+		return "/" + strings.TrimLeft(extraPath, "/")
+	}
+
+	return strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(extraPath, "/")
 }
 
 func withPage(rawURL string, page int, pageSize int) string {
