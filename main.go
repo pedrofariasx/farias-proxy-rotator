@@ -32,6 +32,7 @@ type Config struct {
 	ProxyRefresh               time.Duration
 	ProxyTimeout               time.Duration
 	ProxyAttemptTimeout        time.Duration
+	ProxyStreamTimeout         time.Duration
 	ProxyValidationConcurrency int
 	HealthyProxyTarget         int
 	HealthyProxyMin            int
@@ -123,20 +124,25 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *Pro
 		return
 	}
 
-	resp, proxy, err := requestWithRotation(r.Context(), cfg, pool, targetURL, r.Method, body)
+	isStream := wantsSSE(r)
+	resp, proxy, err := requestWithRotation(r.Context(), cfg, pool, targetURL, r.Method, body, isStream)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "stats": pool.Stats()})
 		return
 	}
 	defer resp.Body.Close()
 
-	copyResponseHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), resp.Header, isStream)
 	w.Header().Set("X-Farias-Upstream-Proxy", fmt.Sprintf("%s://%s:%d", proxy.Protocol, proxy.Host, proxy.Port))
+	if isStream {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	copyResponseBody(w, resp.Body, isStream)
 }
 
-func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, targetURL string, method string, body []byte) (*http.Response, Proxy, error) {
+func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, targetURL string, method string, body []byte, stream bool) (*http.Response, Proxy, error) {
 	ctx, cancel := context.WithTimeout(parent, cfg.ProxyTimeout)
 	defer cancel()
 
@@ -157,7 +163,7 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, ta
 		tried[proxyKey(proxy)] = struct{}{}
 
 		started := time.Now()
-		resp, err := DoThroughProxy(ctx, cfg, proxy, targetURL, method, body)
+		resp, err := DoThroughProxy(ctx, cfg, proxy, targetURL, method, body, stream)
 		if err == nil {
 			pool.MarkSuccess(proxy, time.Since(started))
 			return resp, proxy, nil
@@ -435,7 +441,7 @@ func (p *ProxyPool) DeadCount() int {
 
 func (p *ProxyPool) validateCandidate(ctx context.Context, proxy Proxy) {
 	started := time.Now()
-	resp, err := DoThroughProxy(ctx, p.cfg, proxy, p.cfg.TargetURL, http.MethodGet, nil)
+	resp, err := DoThroughProxy(ctx, p.cfg, proxy, p.cfg.TargetURL, http.MethodGet, nil, false)
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -716,10 +722,14 @@ func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, re
 	return proxies, nil
 }
 
-func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL string, method string, body []byte) (*http.Response, error) {
+func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL string, method string, body []byte, stream bool) (*http.Response, error) {
 	attemptTimeout := cfg.ProxyAttemptTimeout
 	if attemptTimeout <= 0 {
 		attemptTimeout = cfg.ProxyTimeout
+	}
+	clientTimeout := attemptTimeout
+	if stream {
+		clientTimeout = cfg.ProxyStreamTimeout
 	}
 
 	ctx, cancel := context.WithTimeout(parent, attemptTimeout)
@@ -747,7 +757,7 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL s
 	}
 	defer transport.CloseIdleConnections()
 
-	client := &http.Client{Transport: transport, Timeout: attemptTimeout}
+	client := &http.Client{Transport: transport, Timeout: clientTimeout}
 	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -784,6 +794,7 @@ func loadConfig() Config {
 		ProxyRefresh:               time.Duration(intEnv("PROXY_REFRESH_SECONDS", 300)) * time.Second,
 		ProxyTimeout:               time.Duration(intEnv("PROXY_TIMEOUT_MS", 5000)) * time.Millisecond,
 		ProxyAttemptTimeout:        time.Duration(intEnv("PROXY_ATTEMPT_TIMEOUT_MS", 5000)) * time.Millisecond,
+		ProxyStreamTimeout:         time.Duration(intEnv("PROXY_STREAM_TIMEOUT_MS", 0)) * time.Millisecond,
 		ProxyValidationConcurrency: intEnv("PROXY_VALIDATION_CONCURRENCY", 16),
 		HealthyProxyTarget:         intEnv("HEALTHY_PROXY_TARGET", 25),
 		HealthyProxyMin:            intEnv("HEALTHY_PROXY_MIN", 5),
@@ -845,9 +856,10 @@ func parseTargetHeaders() http.Header {
 	return headers
 }
 
-func copyResponseHeaders(dst, src http.Header) {
+func copyResponseHeaders(dst, src http.Header, stream bool) {
 	blocked := map[string]struct{}{
 		"Connection":          {},
+		"Content-Length":      {},
 		"Keep-Alive":          {},
 		"Proxy-Authenticate":  {},
 		"Proxy-Authorization": {},
@@ -865,6 +877,39 @@ func copyResponseHeaders(dst, src http.Header) {
 			dst.Add(name, value)
 		}
 	}
+}
+
+func copyResponseBody(w http.ResponseWriter, body io.Reader, stream bool) {
+	if !stream {
+		_, _ = io.Copy(w, body)
+		return
+	}
+
+	flusher, _ := w.(http.Flusher)
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buffer)
+		if n > 0 {
+			_, _ = w.Write(buffer[:n])
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func wantsSSE(r *http.Request) bool {
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
+		return true
+	}
+	if strings.EqualFold(r.URL.Query().Get("stream"), "true") {
+		return true
+	}
+
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

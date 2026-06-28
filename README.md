@@ -41,6 +41,7 @@ PROXY_REQUIRE_HTTPS=false
 PROXY_REFRESH_SECONDS=300
 PROXY_TIMEOUT_MS=5000
 PROXY_ATTEMPT_TIMEOUT_MS=5000
+PROXY_STREAM_TIMEOUT_MS=0
 PROXY_VALIDATION_CONCURRENCY=16
 HEALTHY_PROXY_TARGET=25
 HEALTHY_PROXY_MIN=5
@@ -64,6 +65,7 @@ TARGET_HEADERS=
 | `PROXY_REFRESH_SECONDS` | Intervalo de atualização da lista de proxies. |
 | `PROXY_TIMEOUT_MS` | Tempo máximo total esperado para uma requisição. |
 | `PROXY_ATTEMPT_TIMEOUT_MS` | Timeout por tentativa usando um proxy. |
+| `PROXY_STREAM_TIMEOUT_MS` | Timeout para respostas streaming/SSE. `0` mantém stream sem timeout do client HTTP. |
 | `PROXY_VALIDATION_CONCURRENCY` | Quantos proxies validar em paralelo durante manutenção. |
 | `HEALTHY_PROXY_TARGET` | Tamanho alvo do pool de proxies saudáveis. |
 | `HEALTHY_PROXY_MIN` | Mínimo aceitável antes de iniciar reposição automática. |
@@ -184,6 +186,26 @@ curl -X POST http://localhost:3000 \
   -H 'content-type: application/json' \
   -d '{"hello":"world"}'
 ```
+
+## SSE / Streaming
+
+O proxy suporta respostas Server-Sent Events e streaming quando a requisição local envia `Accept: text/event-stream` ou `stream=true` na query string.
+
+Exemplo:
+
+```bash
+curl -N \
+  -H 'Accept: text/event-stream' \
+  'http://localhost:3000/v1/events'
+```
+
+Também funciona com:
+
+```bash
+curl -N 'http://localhost:3000/v1/events?stream=true'
+```
+
+Para SSE, o proxy desativa timeout do client HTTP por padrão com `PROXY_STREAM_TIMEOUT_MS=0`, copia os chunks conforme chegam e força flush imediato para o cliente.
 
 ## Endpoints
 
