@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,9 +24,10 @@ import (
 type Config struct {
 	Port                       int
 	TargetURL                  string
-	ProxyDBURL                 string
-	ProxyDBPages               int
-	ProxyDBPageSize            int
+	ProxySourceURL             string
+	ProxySourcePages           int
+	ProxySourcePageSize        int
+	ProxyRequireHTTPS          bool
 	ProxyRefresh               time.Duration
 	ProxyTimeout               time.Duration
 	ProxyAttemptTimeout        time.Duration
@@ -68,8 +68,6 @@ type ProxyPool struct {
 	refreshing     bool
 	maintaining    bool
 }
-
-var proxyRowPattern = regexp.MustCompile(`<a\s+href="/(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,5})#(https?)"`)
 
 func main() {
 	cfg := loadConfig()
@@ -140,12 +138,16 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, me
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= cfg.MaxProxyAttempts; attempt++ {
-		proxy, err := pool.NextHealthy(ctx)
+	tried := make(map[string]struct{})
+	maxAttempts := min(cfg.MaxProxyAttempts, max(1, pool.HealthyCount()))
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		proxy, err := pool.NextHealthyExcept(ctx, tried)
 		if err != nil {
 			lastErr = err
 			break
 		}
+		tried[proxyKey(proxy)] = struct{}{}
 
 		started := time.Now()
 		resp, err := DoThroughProxy(ctx, cfg, proxy, method, body)
@@ -156,10 +158,10 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, me
 
 		lastErr = err
 		pool.MarkFailure(proxy, err)
-		log.Printf("Proxy saudavel falhou %d/%d via %s:%d: %s", attempt, cfg.MaxProxyAttempts, proxy.Host, proxy.Port, err.Error())
+		log.Printf("Proxy saudavel falhou %d/%d via %s:%d; tentando proximo saudavel: %s", attempt, maxAttempts, proxy.Host, proxy.Port, err.Error())
 	}
 
-	return nil, Proxy{}, fmt.Errorf("nenhum proxy funcionou dentro de %s; pool=%+v; ultimo erro: %v", cfg.ProxyTimeout, pool.Stats(), lastErr)
+	return nil, Proxy{}, fmt.Errorf("nenhum proxy saudavel funcionou dentro de %s apos %d tentativa(s); pool=%+v; ultimo erro: %v", cfg.ProxyTimeout, len(tried), pool.Stats(), lastErr)
 }
 
 func NewProxyPool(cfg Config) *ProxyPool {
@@ -234,7 +236,7 @@ func (p *ProxyPool) Refresh(ctx context.Context, force bool) error {
 		return err
 	}
 	if len(proxies) == 0 {
-		return errors.New("nenhum proxy encontrado no ProxyDB")
+		return errors.New("nenhum proxy encontrado na fonte configurada")
 	}
 
 	p.mergeCandidates(proxies)
@@ -327,6 +329,10 @@ func (p *ProxyPool) EnsureMinimumHealthy(ctx context.Context) error {
 }
 
 func (p *ProxyPool) NextHealthy(ctx context.Context) (Proxy, error) {
+	return p.NextHealthyExcept(ctx, nil)
+}
+
+func (p *ProxyPool) NextHealthyExcept(ctx context.Context, exclude map[string]struct{}) (Proxy, error) {
 	if err := p.EnsureMinimumHealthy(ctx); err != nil {
 		return Proxy{}, err
 	}
@@ -335,9 +341,18 @@ func (p *ProxyPool) NextHealthy(ctx context.Context) (Proxy, error) {
 	defer p.mu.Unlock()
 
 	p.sortHealthyLocked()
-	item := p.healthy[p.healthyIndex%len(p.healthy)]
-	p.healthyIndex++
-	return item.Proxy, nil
+	for checked := 0; checked < len(p.healthy); checked++ {
+		item := p.healthy[p.healthyIndex%len(p.healthy)]
+		p.healthyIndex++
+
+		if _, skip := exclude[proxyKey(item.Proxy)]; skip {
+			continue
+		}
+
+		return item.Proxy, nil
+	}
+
+	return Proxy{}, errors.New("todos os proxies saudaveis disponiveis ja foram tentados nesta requisicao")
 }
 
 func (p *ProxyPool) MarkSuccess(proxy Proxy, latency time.Duration) {
@@ -534,16 +549,15 @@ func FetchProxyList(ctx context.Context, cfg Config) ([]Proxy, error) {
 		err     error
 	}
 
-	results := make(chan result, cfg.ProxyDBPages)
+	results := make(chan result, cfg.ProxySourcePages)
 	var wg sync.WaitGroup
 
-	for page := 0; page < cfg.ProxyDBPages; page++ {
-		offset := page * cfg.ProxyDBPageSize
-		pageURL := withOffset(cfg.ProxyDBURL, offset)
+	for page := 1; page <= cfg.ProxySourcePages; page++ {
+		pageURL := withPage(cfg.ProxySourceURL, page, cfg.ProxySourcePageSize)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			proxies, err := fetchProxyPage(ctx, client, pageURL)
+			proxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS)
 			results <- result{proxies: proxies, err: err}
 		}()
 	}
@@ -580,14 +594,28 @@ func FetchProxyList(ctx context.Context, cfg Config) ([]Proxy, error) {
 	return proxies, nil
 }
 
-func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string) ([]Proxy, error) {
+type freeProxyDBResponse struct {
+	Data struct {
+		TotalCount int `json:"total_count"`
+		Data       []struct {
+			IP       string `json:"ip"`
+			Port     int    `json:"port"`
+			Protocol string `json:"protocol"`
+			IsValid  int    `json:"is_valid"`
+			HTTPS    int    `json:"https"`
+		} `json:"data"`
+	} `json:"data"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
+}
+
+func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, requireHTTPS bool) ([]Proxy, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-	req.Header.Set("Referer", "https://proxydb.net/?protocol=https&country=")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 
 	resp, err := client.Do(req)
@@ -597,29 +625,34 @@ func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string) ([
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("ProxyDB respondeu HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("FreeProxyDB respondeu HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	var payload freeProxyDBResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
 
-	return parseProxyDBHTML(string(body)), nil
-}
+	if payload.Status != 1 {
+		return nil, fmt.Errorf("FreeProxyDB respondeu status=%d message=%q", payload.Status, payload.Message)
+	}
 
-func parseProxyDBHTML(html string) []Proxy {
-	matches := proxyRowPattern.FindAllStringSubmatch(html, -1)
 	seen := make(map[string]struct{})
-	proxies := make([]Proxy, 0, len(matches))
-
-	for _, match := range matches {
-		port, err := strconv.Atoi(match[2])
-		if err != nil || port < 1 || port > 65535 || net.ParseIP(match[1]) == nil {
+	proxies := make([]Proxy, 0, len(payload.Data.Data))
+	for _, item := range payload.Data.Data {
+		if item.IsValid != 1 || item.Port < 1 || item.Port > 65535 || net.ParseIP(item.IP) == nil {
+			continue
+		}
+		if requireHTTPS && item.HTTPS != 1 {
 			continue
 		}
 
-		proxy := Proxy{Host: match[1], Port: port, Protocol: match[3]}
+		protocol := strings.ToLower(item.Protocol)
+		if protocol == "" {
+			protocol = "http"
+		}
+
+		proxy := Proxy{Host: item.IP, Port: item.Port, Protocol: protocol}
 		key := proxyKey(proxy)
 		if _, ok := seen[key]; ok {
 			continue
@@ -628,7 +661,7 @@ func parseProxyDBHTML(html string) []Proxy {
 		proxies = append(proxies, proxy)
 	}
 
-	return proxies
+	return proxies, nil
 }
 
 func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, method string, body []byte) (*http.Response, error) {
@@ -691,9 +724,10 @@ func loadConfig() Config {
 	return Config{
 		Port:                       intEnv("PORT", 3000),
 		TargetURL:                  stringEnv("TARGET_URL", "https://httpbin.org/ip"),
-		ProxyDBURL:                 stringEnv("PROXYDB_URL", "https://proxydb.net/?country=&protocol=http&protocol=https&sort_column_id=uptime&sort_order_desc=true"),
-		ProxyDBPages:               intEnv("PROXYDB_PAGES", 30),
-		ProxyDBPageSize:            intEnv("PROXYDB_PAGE_SIZE", 30),
+		ProxySourceURL:             stringEnv("PROXY_SOURCE_URL", "https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100"),
+		ProxySourcePages:           intEnv("PROXY_SOURCE_PAGES", 20),
+		ProxySourcePageSize:        intEnv("PROXY_SOURCE_PAGE_SIZE", 100),
+		ProxyRequireHTTPS:          boolEnv("PROXY_REQUIRE_HTTPS", false),
 		ProxyRefresh:               time.Duration(intEnv("PROXY_REFRESH_SECONDS", 300)) * time.Second,
 		ProxyTimeout:               time.Duration(intEnv("PROXY_TIMEOUT_MS", 5000)) * time.Millisecond,
 		ProxyAttemptTimeout:        time.Duration(intEnv("PROXY_ATTEMPT_TIMEOUT_MS", 5000)) * time.Millisecond,
@@ -701,7 +735,7 @@ func loadConfig() Config {
 		HealthyProxyTarget:         intEnv("HEALTHY_PROXY_TARGET", 25),
 		HealthyProxyMin:            intEnv("HEALTHY_PROXY_MIN", 5),
 		MaxProxyFailures:           intEnv("MAX_PROXY_FAILURES", 2),
-		MaxProxyAttempts:           intEnv("MAX_PROXY_ATTEMPTS", 5),
+		MaxProxyAttempts:           intEnv("MAX_PROXY_ATTEMPTS", 25),
 		TargetHeaders:              parseTargetHeaders(),
 	}
 }
@@ -786,18 +820,15 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func withOffset(rawURL string, offset int) string {
+func withPage(rawURL string, page int, pageSize int) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
 
 	query := parsed.Query()
-	if offset == 0 {
-		query.Del("offset")
-	} else {
-		query.Set("offset", strconv.Itoa(offset))
-	}
+	query.Set("page_index", strconv.Itoa(page))
+	query.Set("page_size", strconv.Itoa(pageSize))
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }
@@ -823,4 +854,13 @@ func intEnv(name string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func boolEnv(name string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if value == "" {
+		return fallback
+	}
+
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }

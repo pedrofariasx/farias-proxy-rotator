@@ -1,12 +1,12 @@
 # Farias Proxy Rotator
 
-Proxy rotativo leve em Go com coleta de proxies públicos do ProxyDB, validação automática e manutenção de um pool de proxies saudáveis.
+Proxy rotativo leve em Go com coleta de proxies públicos do FreeProxyDB, validação automática e manutenção de um pool de proxies saudáveis.
 
 Este projeto foi criado apenas para fins de estudo, pesquisa e aprendizado sobre redes, proxies, concorrência em Go e manutenção de pools de conexões. O uso indevido para burlar restrições, atacar serviços, coletar dados sem autorização, fraudar sistemas ou violar termos de uso de terceiros não é incentivado nem apoiado.
 
 ## Funcionalidades
 
-- Busca proxies no ProxyDB com paginação.
+- Busca proxies no FreeProxyDB com paginação.
 - Valida proxies em paralelo antes de usá-los.
 - Mantém um pool de proxies saudáveis em memória.
 - Remove proxies que começam a falhar.
@@ -33,9 +33,10 @@ Exemplo de configuração:
 ```env
 PORT=3000
 TARGET_URL=https://httpbin.org/ip
-PROXYDB_URL=https://proxydb.net/?country=&protocol=http&protocol=https&sort_column_id=uptime&sort_order_desc=true
-PROXYDB_PAGES=30
-PROXYDB_PAGE_SIZE=30
+PROXY_SOURCE_URL=https://freeproxydb.com/api/proxy/search?country=&protocol=http&anonymity=elite,anonymous&speed=0,60&page_index=1&page_size=100
+PROXY_SOURCE_PAGES=20
+PROXY_SOURCE_PAGE_SIZE=100
+PROXY_REQUIRE_HTTPS=false
 PROXY_REFRESH_SECONDS=300
 PROXY_TIMEOUT_MS=5000
 PROXY_ATTEMPT_TIMEOUT_MS=5000
@@ -54,9 +55,10 @@ TARGET_HEADERS=
 |---|---|
 | `PORT` | Porta local do servidor. |
 | `TARGET_URL` | URL final que será chamada através dos proxies. |
-| `PROXYDB_URL` | URL base do ProxyDB usada para coletar proxies. |
-| `PROXYDB_PAGES` | Quantidade de páginas do ProxyDB para buscar. |
-| `PROXYDB_PAGE_SIZE` | Tamanho da página no ProxyDB. Normalmente `30`. |
+| `PROXY_SOURCE_URL` | URL base do FreeProxyDB usada para coletar proxies. |
+| `PROXY_SOURCE_PAGES` | Quantidade de páginas do FreeProxyDB para buscar. |
+| `PROXY_SOURCE_PAGE_SIZE` | Tamanho da página no FreeProxyDB. Normalmente `100`. |
+| `PROXY_REQUIRE_HTTPS` | Se `true`, usa apenas proxies marcados como HTTPS pela fonte. Por padrão fica `false` porque proxies HTTP também podem fazer `CONNECT` para targets HTTPS. |
 | `PROXY_REFRESH_SECONDS` | Intervalo de atualização da lista de proxies. |
 | `PROXY_TIMEOUT_MS` | Tempo máximo total esperado para uma requisição. |
 | `PROXY_ATTEMPT_TIMEOUT_MS` | Timeout por tentativa usando um proxy. |
@@ -168,7 +170,7 @@ Exemplo de resposta:
 
 ### `GET /refresh`
 
-Força nova busca no ProxyDB e inicia manutenção do pool:
+Força nova busca no FreeProxyDB e inicia manutenção do pool:
 
 ```bash
 curl http://localhost:3000/refresh
@@ -176,7 +178,7 @@ curl http://localhost:3000/refresh
 
 ## Como O Pool Funciona
 
-1. O sistema coleta proxies do ProxyDB.
+1. O sistema coleta proxies do FreeProxyDB.
 2. Proxies novos entram como candidatos.
 3. Candidatos são testados contra a própria `TARGET_URL`.
 4. Proxies funcionais entram no pool saudável.
@@ -186,7 +188,7 @@ curl http://localhost:3000/refresh
 
 ## Observações
 
-Proxies públicos costumam ser instáveis. Mesmo com validação e manutenção automática, a disponibilidade depende da qualidade da lista retornada pelo ProxyDB.
+Proxies públicos costumam ser instáveis. Mesmo com validação e manutenção automática, a disponibilidade depende da qualidade da lista retornada pelo FreeProxyDB.
 
 ## Uso Responsável
 
