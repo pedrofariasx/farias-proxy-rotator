@@ -143,10 +143,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *Pro
 }
 
 func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, targetURL string, method string, body []byte, stream bool) (*http.Response, Proxy, error) {
-	ctx, cancel := context.WithTimeout(parent, cfg.ProxyTimeout)
+	rotationCtx, cancel := context.WithTimeout(parent, cfg.ProxyTimeout)
 	defer cancel()
 
-	if err := pool.EnsureMinimumHealthy(ctx); err != nil {
+	if err := pool.EnsureMinimumHealthy(rotationCtx); err != nil {
 		return nil, Proxy{}, err
 	}
 
@@ -155,7 +155,7 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, ta
 	maxAttempts := min(cfg.MaxProxyAttempts, max(1, pool.HealthyCount()))
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		proxy, err := pool.NextHealthyExcept(ctx, tried)
+		proxy, err := pool.NextHealthyExcept(rotationCtx, tried)
 		if err != nil {
 			lastErr = err
 			break
@@ -163,7 +163,12 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, ta
 		tried[proxyKey(proxy)] = struct{}{}
 
 		started := time.Now()
-		resp, err := DoThroughProxy(ctx, cfg, proxy, targetURL, method, body, stream)
+		requestCtx := rotationCtx
+		if stream {
+			requestCtx = parent
+		}
+
+		resp, err := DoThroughProxy(requestCtx, cfg, proxy, targetURL, method, body, stream)
 		if err == nil {
 			pool.MarkSuccess(proxy, time.Since(started))
 			return resp, proxy, nil

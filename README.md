@@ -207,6 +207,8 @@ curl -N 'http://localhost:3000/v1/events?stream=true'
 
 Para SSE, o proxy desativa timeout do client HTTP por padrão com `PROXY_STREAM_TIMEOUT_MS=0`, copia os chunks conforme chegam e força flush imediato para o cliente.
 
+Depois que o stream é estabelecido, a conexão permanece aberta até a API de destino finalizar, o cliente desconectar ou `PROXY_STREAM_TIMEOUT_MS` encerrar a conexão quando configurado com valor maior que `0`. O `PROXY_TIMEOUT_MS` é usado apenas para encontrar um proxy saudável e abrir a resposta inicial.
+
 ## Endpoints
 
 ### `GET /health`
