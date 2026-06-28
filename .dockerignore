@@ -1,0 +1,11 @@
+.git
+.env
+farias-proxy-rotator
+Dockerfile
+docker-compose.yml
+README.md
+LICENSE
+package.json
+*.log
+tmp
+dist

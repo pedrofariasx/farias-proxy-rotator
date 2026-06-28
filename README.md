@@ -128,6 +128,31 @@ Executar o binário:
 ./farias-proxy-rotator
 ```
 
+## Docker
+
+Build da imagem:
+
+```bash
+docker build -t farias-proxy-rotator .
+```
+
+Executar usando o arquivo `.env` local:
+
+```bash
+docker run --rm \
+  --env-file .env \
+  -p 3000:3000 \
+  farias-proxy-rotator
+```
+
+Com Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Em produção, prefira passar variáveis de ambiente pelo orquestrador ou secret manager em vez de copiar arquivos sensíveis para a imagem. O `.env` é ignorado pelo Docker build e pelo Git.
+
 ## Uso
 
 Qualquer requisição enviada ao servidor local será encaminhada para `TARGET_URL` usando um proxy saudável.
