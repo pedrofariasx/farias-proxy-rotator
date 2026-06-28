@@ -33,11 +33,17 @@ type Config struct {
 	ProxyTimeout               time.Duration
 	ProxyAttemptTimeout        time.Duration
 	ProxyStreamTimeout         time.Duration
+	TargetResponseTimeout      time.Duration
+	ProxyConnectTimeout        time.Duration
+	ProxyHeaderTimeout         time.Duration
+	MaxConcurrentRequests      int
 	ProxyValidationConcurrency int
 	HealthyProxyTarget         int
 	HealthyProxyMin            int
 	MaxProxyFailures           int
 	MaxProxyAttempts           int
+	ProxySourceOnlyValid       bool
+	DeadProxyRetryAfter        time.Duration
 	TargetHeaders              http.Header
 }
 
@@ -62,13 +68,14 @@ type ProxyPool struct {
 	mu             sync.Mutex
 	proxies        []Proxy
 	candidates     []Proxy
-	dead           map[string]struct{}
+	dead           map[string]time.Time
 	healthy        []*HealthyProxy
 	candidateIndex int
 	healthyIndex   int
 	lastRefresh    time.Time
 	refreshing     bool
 	maintaining    bool
+	requestSlots   chan struct{}
 }
 
 func main() {
@@ -93,6 +100,12 @@ func main() {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request, cfg Config, pool *ProxyPool) {
+	if !pool.AcquireRequest(r.Context()) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "limite de requisicoes simultaneas atingido"})
+		return
+	}
+	defer pool.ReleaseRequest()
+
 	if r.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "stats": pool.Stats()})
 		return
@@ -163,27 +176,57 @@ func requestWithRotation(parent context.Context, cfg Config, pool *ProxyPool, ta
 		tried[proxyKey(proxy)] = struct{}{}
 
 		started := time.Now()
-		requestCtx := rotationCtx
-		if stream {
-			requestCtx = parent
-		}
-
-		resp, err := DoThroughProxy(requestCtx, cfg, proxy, targetURL, method, body, stream)
+		resp, err := DoThroughProxy(parent, cfg, proxy, targetURL, method, body, stream)
 		if err == nil {
 			pool.MarkSuccess(proxy, time.Since(started))
 			return resp, proxy, nil
 		}
 
 		lastErr = err
-		pool.MarkFailure(proxy, err)
+		if !isContextTimeout(err) {
+			pool.MarkFailure(proxy, err)
+		}
 		log.Printf("Proxy saudavel falhou %d/%d via %s:%d; tentando proximo saudavel: %s", attempt, maxAttempts, proxy.Host, proxy.Port, err.Error())
+		if parent.Err() != nil || rotationCtx.Err() != nil {
+			break
+		}
 	}
 
 	return nil, Proxy{}, fmt.Errorf("nenhum proxy saudavel funcionou dentro de %s apos %d tentativa(s); pool=%+v; ultimo erro: %v", cfg.ProxyTimeout, len(tried), pool.Stats(), lastErr)
 }
 
 func NewProxyPool(cfg Config) *ProxyPool {
-	return &ProxyPool{cfg: cfg, dead: make(map[string]struct{})}
+	pool := &ProxyPool{cfg: cfg, dead: make(map[string]time.Time)}
+	if cfg.MaxConcurrentRequests > 0 {
+		pool.requestSlots = make(chan struct{}, cfg.MaxConcurrentRequests)
+	}
+	return pool
+}
+
+func (p *ProxyPool) AcquireRequest(ctx context.Context) bool {
+	if p.requestSlots == nil {
+		return true
+	}
+
+	select {
+	case p.requestSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		return false
+	}
+}
+
+func (p *ProxyPool) ReleaseRequest() {
+	if p.requestSlots == nil {
+		return
+	}
+
+	select {
+	case <-p.requestSlots:
+	default:
+	}
 }
 
 func (p *ProxyPool) StartMaintenance() {
@@ -452,7 +495,7 @@ func (p *ProxyPool) validateCandidate(ctx context.Context, proxy Proxy) {
 	}
 	if err != nil {
 		p.mu.Lock()
-		p.dead[proxyKey(proxy)] = struct{}{}
+		p.dead[proxyKey(proxy)] = time.Now()
 		p.mu.Unlock()
 		return
 	}
@@ -461,19 +504,21 @@ func (p *ProxyPool) validateCandidate(ctx context.Context, proxy Proxy) {
 }
 
 func (p *ProxyPool) mergeCandidates(proxies []Proxy) int {
-	known := make(map[string]struct{}, len(p.proxies)+len(p.healthy)+len(p.dead))
+	known := make(map[string]struct{}, len(p.proxies)+len(p.healthy))
 	for _, proxy := range p.proxies {
 		known[proxyKey(proxy)] = struct{}{}
 	}
 	for _, proxy := range p.healthy {
 		known[proxyKey(proxy.Proxy)] = struct{}{}
 	}
-	// Proxies descartados podem voltar a ficar validos em outra coleta; permitir
-	// reentrada evita esgotar a fonte quando a API retorna poucos itens por pagina.
+	now := time.Now()
 
 	added := 0
 	for _, proxy := range proxies {
 		key := proxyKey(proxy)
+		if deadAt, ok := p.dead[key]; ok && now.Sub(deadAt) < p.cfg.DeadProxyRetryAfter {
+			continue
+		}
 		if _, ok := known[key]; ok {
 			continue
 		}
@@ -495,7 +540,7 @@ func (p *ProxyPool) nextCandidate() (Proxy, bool) {
 		proxy := p.candidates[p.candidateIndex]
 		p.candidateIndex++
 
-		if _, dead := p.dead[proxyKey(proxy)]; dead {
+		if deadAt, dead := p.dead[proxyKey(proxy)]; dead && time.Since(deadAt) < p.cfg.DeadProxyRetryAfter {
 			continue
 		}
 		if p.findHealthyLocked(proxy) != nil {
@@ -532,7 +577,7 @@ func (p *ProxyPool) removeHealthy(proxy Proxy) {
 	defer p.mu.Unlock()
 
 	key := proxyKey(proxy)
-	p.dead[key] = struct{}{}
+	p.dead[key] = time.Now()
 	filtered := p.healthy[:0]
 	for _, item := range p.healthy {
 		if proxyKey(item.Proxy) != key {
@@ -584,7 +629,7 @@ func FetchProxyList(ctx context.Context, cfg Config) ([]Proxy, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			proxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS)
+			proxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS, cfg.ProxySourceOnlyValid)
 			results <- result{proxies: proxies, err: err}
 		}()
 	}
@@ -635,7 +680,7 @@ func fetchProxyListSequential(ctx context.Context, client *http.Client, cfg Conf
 
 	for page := startPage; page <= maxPage && len(proxies) < cfg.HealthyProxyTarget; page++ {
 		pageURL := withPage(cfg.ProxySourceURL, page, cfg.ProxySourcePageSize)
-		pageProxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS)
+		pageProxies, err := fetchProxyPage(ctx, client, pageURL, cfg.ProxyRequireHTTPS, cfg.ProxySourceOnlyValid)
 		if err != nil {
 			lastErr = err
 			continue
@@ -672,7 +717,7 @@ type freeProxyDBResponse struct {
 	Status  int    `json:"status"`
 }
 
-func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, requireHTTPS bool) ([]Proxy, error) {
+func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, requireHTTPS bool, onlyValid bool) ([]Proxy, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
 		return nil, err
@@ -703,7 +748,10 @@ func fetchProxyPage(ctx context.Context, client *http.Client, pageURL string, re
 	seen := make(map[string]struct{})
 	proxies := make([]Proxy, 0, len(payload.Data.Data))
 	for _, item := range payload.Data.Data {
-		if item.IsValid != 1 || item.Port < 1 || item.Port > 65535 || net.ParseIP(item.IP) == nil {
+		if onlyValid && item.IsValid != 1 {
+			continue
+		}
+		if item.Port < 1 || item.Port > 65535 || net.ParseIP(item.IP) == nil {
 			continue
 		}
 		if requireHTTPS && item.HTTPS != 1 {
@@ -732,12 +780,25 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL s
 	if attemptTimeout <= 0 {
 		attemptTimeout = cfg.ProxyTimeout
 	}
-	clientTimeout := attemptTimeout
+	connectTimeout := cfg.ProxyConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = attemptTimeout
+	}
+	headerTimeout := cfg.ProxyHeaderTimeout
+	if headerTimeout <= 0 {
+		headerTimeout = cfg.TargetResponseTimeout
+	}
+	if headerTimeout <= 0 {
+		headerTimeout = 0
+	}
+	requestCtx := parent
+	cancel := func() {}
+	clientTimeout := cfg.TargetResponseTimeout
 	if stream {
 		clientTimeout = cfg.ProxyStreamTimeout
+	} else if cfg.TargetResponseTimeout > 0 {
+		requestCtx, cancel = context.WithTimeout(parent, cfg.TargetResponseTimeout)
 	}
-
-	ctx, cancel := context.WithTimeout(parent, attemptTimeout)
 	defer cancel()
 
 	target, err := url.Parse(targetURL)
@@ -751,19 +812,19 @@ func DoThroughProxy(parent context.Context, cfg Config, proxy Proxy, targetURL s
 			Host:   net.JoinHostPort(proxy.Host, strconv.Itoa(proxy.Port)),
 		}),
 		DialContext: (&net.Dialer{
-			Timeout:   attemptTimeout,
+			Timeout:   connectTimeout,
 			KeepAlive: 15 * time.Second,
 		}).DialContext,
 		TLSClientConfig:       &tls.Config{ServerName: target.Hostname(), MinVersion: tls.VersionTLS12},
-		TLSHandshakeTimeout:   attemptTimeout,
-		ResponseHeaderTimeout: attemptTimeout,
+		TLSHandshakeTimeout:   connectTimeout,
+		ResponseHeaderTimeout: headerTimeout,
 		ExpectContinueTimeout: time.Second,
 		DisableKeepAlives:     true,
 	}
 	defer transport.CloseIdleConnections()
 
 	client := &http.Client{Transport: transport, Timeout: clientTimeout}
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(requestCtx, method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -796,10 +857,16 @@ func loadConfig() Config {
 		ProxySourcePageSize:        intEnv("PROXY_SOURCE_PAGE_SIZE", 100),
 		ProxySourceMaxPages:        intEnv("PROXY_SOURCE_MAX_PAGES", 100),
 		ProxyRequireHTTPS:          boolEnv("PROXY_REQUIRE_HTTPS", false),
+		ProxySourceOnlyValid:       boolEnv("PROXY_SOURCE_ONLY_VALID", false),
+		DeadProxyRetryAfter:        time.Duration(intEnv("DEAD_PROXY_RETRY_SECONDS", 120)) * time.Second,
 		ProxyRefresh:               time.Duration(intEnv("PROXY_REFRESH_SECONDS", 300)) * time.Second,
 		ProxyTimeout:               time.Duration(intEnv("PROXY_TIMEOUT_MS", 5000)) * time.Millisecond,
 		ProxyAttemptTimeout:        time.Duration(intEnv("PROXY_ATTEMPT_TIMEOUT_MS", 5000)) * time.Millisecond,
 		ProxyStreamTimeout:         time.Duration(intEnv("PROXY_STREAM_TIMEOUT_MS", 0)) * time.Millisecond,
+		TargetResponseTimeout:      time.Duration(intEnv("TARGET_RESPONSE_TIMEOUT_MS", 0)) * time.Millisecond,
+		ProxyConnectTimeout:        time.Duration(intEnv("PROXY_CONNECT_TIMEOUT_MS", 5000)) * time.Millisecond,
+		ProxyHeaderTimeout:         time.Duration(intEnv("PROXY_HEADER_TIMEOUT_MS", 0)) * time.Millisecond,
+		MaxConcurrentRequests:      intEnv("MAX_CONCURRENT_REQUESTS", 0),
 		ProxyValidationConcurrency: intEnv("PROXY_VALIDATION_CONCURRENCY", 16),
 		HealthyProxyTarget:         intEnv("HEALTHY_PROXY_TARGET", 25),
 		HealthyProxyMin:            intEnv("HEALTHY_PROXY_MIN", 5),
@@ -915,6 +982,17 @@ func wantsSSE(r *http.Request) bool {
 	}
 
 	return false
+}
+
+func isContextTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	return strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "context canceled")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

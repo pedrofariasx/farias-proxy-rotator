@@ -38,14 +38,20 @@ PROXY_SOURCE_PAGES=20
 PROXY_SOURCE_PAGE_SIZE=100
 PROXY_SOURCE_MAX_PAGES=100
 PROXY_REQUIRE_HTTPS=false
+PROXY_SOURCE_ONLY_VALID=false
 PROXY_REFRESH_SECONDS=300
 PROXY_TIMEOUT_MS=5000
 PROXY_ATTEMPT_TIMEOUT_MS=5000
 PROXY_STREAM_TIMEOUT_MS=0
+TARGET_RESPONSE_TIMEOUT_MS=0
+PROXY_CONNECT_TIMEOUT_MS=5000
+PROXY_HEADER_TIMEOUT_MS=0
+MAX_CONCURRENT_REQUESTS=0
 PROXY_VALIDATION_CONCURRENCY=16
 HEALTHY_PROXY_TARGET=25
 HEALTHY_PROXY_MIN=5
 MAX_PROXY_FAILURES=2
+DEAD_PROXY_RETRY_SECONDS=120
 MAX_PROXY_ATTEMPTS=5
 TARGET_AUTHORIZATION=
 TARGET_HEADERS=
@@ -62,14 +68,20 @@ TARGET_HEADERS=
 | `PROXY_SOURCE_PAGE_SIZE` | Tamanho da página no FreeProxyDB. Normalmente `100`. |
 | `PROXY_SOURCE_MAX_PAGES` | Limite máximo de páginas extras para continuar buscando quando a fonte retorna poucos candidatos. |
 | `PROXY_REQUIRE_HTTPS` | Se `true`, usa apenas proxies marcados como HTTPS pela fonte. Por padrão fica `false` porque proxies HTTP também podem fazer `CONNECT` para targets HTTPS. |
+| `PROXY_SOURCE_ONLY_VALID` | Se `true`, usa apenas proxies marcados como válidos pela fonte. Por padrão fica `false` porque a validação real é feita contra o seu `TARGET_URL`. |
 | `PROXY_REFRESH_SECONDS` | Intervalo de atualização da lista de proxies. |
 | `PROXY_TIMEOUT_MS` | Tempo máximo total esperado para uma requisição. |
 | `PROXY_ATTEMPT_TIMEOUT_MS` | Timeout por tentativa usando um proxy. |
 | `PROXY_STREAM_TIMEOUT_MS` | Timeout para respostas streaming/SSE. `0` mantém stream sem timeout do client HTTP. |
+| `TARGET_RESPONSE_TIMEOUT_MS` | Timeout da resposta do target depois que a conexão foi aberta. `0` desativa timeout de resposta, útil para APIs de IA lentas ou streaming. |
+| `PROXY_CONNECT_TIMEOUT_MS` | Timeout apenas para conectar no proxy e fazer handshake TLS. |
+| `PROXY_HEADER_TIMEOUT_MS` | Timeout para aguardar headers do target. `0` desativa, recomendado para contextos grandes em APIs de IA. |
+| `MAX_CONCURRENT_REQUESTS` | Limite global de requisições simultâneas. `0` deixa ilimitado. |
 | `PROXY_VALIDATION_CONCURRENCY` | Quantos proxies validar em paralelo durante manutenção. |
 | `HEALTHY_PROXY_TARGET` | Tamanho alvo do pool de proxies saudáveis. |
 | `HEALTHY_PROXY_MIN` | Mínimo aceitável antes de iniciar reposição automática. |
 | `MAX_PROXY_FAILURES` | Falhas permitidas antes de descartar um proxy saudável. |
+| `DEAD_PROXY_RETRY_SECONDS` | Tempo antes de permitir testar novamente um proxy descartado. |
 | `MAX_PROXY_ATTEMPTS` | Quantos proxies saudáveis tentar por requisição real. |
 | `TARGET_AUTHORIZATION` | Valor do header `Authorization` enviado ao target. |
 | `TARGET_HEADERS` | Headers extras no formato `header: valor|outro: valor`. |
